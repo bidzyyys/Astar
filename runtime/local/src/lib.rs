@@ -28,12 +28,12 @@ use frame_support::{
     construct_runtime, parameter_types,
     traits::{
         AsEnsureOriginWithArg, ConstU128, ConstU32, ConstU64, Currency, EitherOfDiverse,
-        EqualPrivilegeOnly, FindAuthor, Get, InstanceFilter, KeyOwnerProofSystem, Nothing,
+        EqualPrivilegeOnly, FindAuthor, Get, Imbalance, InstanceFilter, OnUnbalanced, KeyOwnerProofSystem, Nothing, Randomness,
         WithdrawReasons,
     },
     weights::{
-        constants::{RocksDbWeight, WEIGHT_REF_TIME_PER_SECOND},
-        ConstantMultiplier, IdentityFee, Weight,
+        constants::{RocksDbWeight, ExtrinsicBaseWeight, WEIGHT_REF_TIME_PER_SECOND},
+        ConstantMultiplier, Weight, WeightToFeePolynomial, WeightToFeeCoefficients, WeightToFeeCoefficient
     },
     ConsensusEngineId, PalletId,
 };
@@ -43,6 +43,7 @@ use frame_system::{
 };
 use pallet_ethereum::PostLogContent;
 use pallet_evm::{FeeCalculator, Runner};
+use pallet_transaction_payment::{Multiplier, TargetedFeeAdjustment};
 use pallet_evm_precompile_assets_erc20::AddressToAssetId;
 use pallet_grandpa::{fg_primitives, AuthorityList as GrandpaAuthorityList};
 use parity_scale_codec::{Compact, Decode, Encode, MaxEncodedLen};
@@ -51,14 +52,14 @@ use sp_core::{crypto::KeyTypeId, ConstBool, OpaqueMetadata, H160, H256, U256};
 use sp_runtime::{
     create_runtime_str, generic, impl_opaque_keys,
     traits::{
-        AccountIdConversion, AccountIdLookup, BlakeTwo256, Block as BlockT, ConvertInto,
+        AccountIdConversion, AccountIdLookup, BlakeTwo256, Block as BlockT, Bounded, ConvertInto,
         DispatchInfoOf, Dispatchable, IdentifyAccount, NumberFor, PostDispatchInfoOf,
-        UniqueSaturatedInto, Verify,
+        UniqueSaturatedInto, Verify, Zero
     },
     transaction_validity::{
         TransactionPriority, TransactionSource, TransactionValidity, TransactionValidityError,
     },
-    ApplyExtrinsicResult, MultiSignature, RuntimeDebug,
+    ApplyExtrinsicResult, FixedPointNumber, MultiSignature, RuntimeDebug, Perquintill
 };
 use sp_std::prelude::*;
 
@@ -70,7 +71,6 @@ pub use frame_system::Call as SystemCall;
 pub use pallet_balances::Call as BalancesCall;
 pub use pallet_grandpa::AuthorityId as GrandpaId;
 pub use pallet_timestamp::Call as TimestampCall;
-use pallet_transaction_payment::CurrencyAdapter;
 pub use sp_consensus_aura::sr25519::AuthorityId as AuraId;
 #[cfg(any(feature = "std", test))]
 pub use sp_runtime::BuildStorage;
@@ -113,30 +113,35 @@ mod chain_extensions;
 pub use chain_extensions::*;
 
 /// Constant values used within the runtime.
-pub const MICROAST: Balance = 1_000_000_000_000;
-pub const MILLIAST: Balance = 1_000 * MICROAST;
-pub const AST: Balance = 1_000 * MILLIAST;
+pub const MICROASTR: Balance = 1_000_000_000_000;
+pub const MILLIASTR: Balance = 1_000 * MICROASTR;
+pub const ASTR: Balance = 1_000 * MILLIASTR;
 
-pub const STORAGE_BYTE_FEE: Balance = 100 * MICROAST;
+pub const INIT_SUPPLY_FACTOR: Balance = 100;
+
+pub const STORAGE_BYTE_FEE: Balance = 20 * MICROASTR * INIT_SUPPLY_FACTOR;
 
 /// Charge fee for stored bytes and items.
 pub const fn deposit(items: u32, bytes: u32) -> Balance {
-    items as Balance * 1 * AST + (bytes as Balance) * STORAGE_BYTE_FEE
+    items as Balance * 100 * MILLIASTR * INIT_SUPPLY_FACTOR + (bytes as Balance) * STORAGE_BYTE_FEE
 }
 
-/// This determines the average expected block time that we are targeting.
-/// Blocks will be produced at a minimum duration defined by `SLOT_DURATION`.
-/// `SLOT_DURATION` is picked up by `pallet_timestamp` which is in turn picked
-/// up by `pallet_aura` to implement `fn slot_duration()`.
+/// Charge fee for stored bytes and items as part of `pallet-contracts`.
 ///
-/// Change this to adjust the block time.
-pub const MILLISECS_PER_BLOCK: u64 = 2000;
-pub const SLOT_DURATION: u64 = MILLISECS_PER_BLOCK;
+/// The slight difference to general `deposit` function is because there is fixed bound on how large the DB
+/// key can grow so it doesn't make sense to have as high deposit per item as in the general approach.
+pub const fn contracts_deposit(items: u32, bytes: u32) -> Balance {
+    items as Balance * 4 * MILLIASTR * INIT_SUPPLY_FACTOR + (bytes as Balance) * STORAGE_BYTE_FEE
+}
 
+/// Change this to adjust the block time.
+pub const MILLISECS_PER_BLOCK: u64 = 12000;
 // Time is measured by number of blocks.
 pub const MINUTES: BlockNumber = 60_000 / (MILLISECS_PER_BLOCK as BlockNumber);
 pub const HOURS: BlockNumber = MINUTES * 60;
 pub const DAYS: BlockNumber = HOURS * 24;
+
+pub const SLOT_DURATION: u64 = MILLISECS_PER_BLOCK;
 
 pub type AssetId = u128;
 
@@ -286,26 +291,25 @@ impl pallet_timestamp::Config for Runtime {
 impl pallet_insecure_randomness_collective_flip::Config for Runtime {}
 
 parameter_types! {
-    pub const ExistentialDeposit: u128 = 500;
+    pub const ExistentialDeposit: Balance = 1_000_000;
     pub const MaxLocks: u32 = 50;
+    pub const MaxReserves: u32 = 50;
 }
 
 impl pallet_balances::Config for Runtime {
-    type MaxLocks = MaxLocks;
-    type MaxReserves = ();
-    type ReserveIdentifier = [u8; 8];
-    /// The type for recording an account's balance.
     type Balance = Balance;
-    /// The ubiquitous event type.
-    type RuntimeEvent = RuntimeEvent;
     type DustRemoval = ();
+    type RuntimeEvent = RuntimeEvent;
+    type MaxLocks = MaxLocks;
+    type MaxReserves = MaxReserves;
+    type ReserveIdentifier = [u8; 8];
     type ExistentialDeposit = ExistentialDeposit;
-    type AccountStore = System;
+    type AccountStore = frame_system::Pallet<Runtime>;
     type WeightInfo = pallet_balances::weights::SubstrateWeight<Runtime>;
 }
 
 parameter_types! {
-    pub const AssetDeposit: Balance = 1 * AST;
+    pub const AssetDeposit: Balance = 10 * INIT_SUPPLY_FACTOR * ASTR;
     pub const AssetsStringLimit: u32 = 50;
     /// Key = 32 bytes, Value = 36 bytes (32+1+1+1+1)
     // https://github.com/paritytech/substrate/blob/069917b/frame/assets/src/lib.rs#L257L271
@@ -336,25 +340,89 @@ impl pallet_assets::Config for Runtime {
 }
 
 parameter_types! {
-    pub const TransactionByteFee: Balance = 1;
+    pub const TransactionByteFee: Balance = MILLIASTR / 100;
+    pub const TargetBlockFullness: Perquintill = Perquintill::from_percent(25);
     pub const OperationalFeeMultiplier: u8 = 5;
+    pub AdjustmentVariable: Multiplier = Multiplier::saturating_from_rational(1, 100_000);
+    pub MinimumMultiplier: Multiplier = Multiplier::saturating_from_rational(1, 1_000_000_000u128);
+    pub MaximumMultiplier: Multiplier = Bounded::max_value();
+}
+
+/// Handles converting a weight scalar to a fee value, based on the scale and granularity of the
+/// node's balance type.
+///
+/// This should typically create a mapping between the following ranges:
+///   - [0, MAXIMUM_BLOCK_WEIGHT]
+///   - [Balance::min, Balance::max]
+///
+/// Yet, it can be used for any other sort of change to weight-fee. Some examples being:
+///   - Setting it to `0` will essentially disable the weight fee.
+///   - Setting it to `1` will cause the literal `#[weight = x]` values to be charged.
+pub struct WeightToFee;
+impl WeightToFeePolynomial for WeightToFee {
+    type Balance = Balance;
+    fn polynomial() -> WeightToFeeCoefficients<Self::Balance> {
+        // in Astar, extrinsic base weight (smallest non-zero weight) is mapped to 1/10 mASTR:
+        let p = MILLIASTR;
+        let q = 10 * Balance::from(ExtrinsicBaseWeight::get().ref_time());
+        smallvec::smallvec![WeightToFeeCoefficient {
+            degree: 1,
+            negative: false,
+            coeff_frac: Perbill::from_rational(p % q, q),
+            coeff_integer: p / q,
+        }]
+    }
+}
+
+pub struct DealWithFees;
+impl OnUnbalanced<NegativeImbalance> for DealWithFees {
+    fn on_unbalanceds<B>(mut fees_then_tips: impl Iterator<Item = NegativeImbalance>) {
+        if let Some(mut fees) = fees_then_tips.next() {
+            if let Some(tips) = fees_then_tips.next() {
+                tips.merge_into(&mut fees);
+            }
+
+            let (to_burn, collators) = fees.ration(20, 80);
+
+            // burn part of fees
+            drop(to_burn);
+
+            // pay fees to collators
+            <ToStakingPot as OnUnbalanced<_>>::on_unbalanced(collators);
+        }
+    }
 }
 
 impl pallet_transaction_payment::Config for Runtime {
     type RuntimeEvent = RuntimeEvent;
-    type OnChargeTransaction = CurrencyAdapter<Balances, ()>;
-    type WeightToFee = IdentityFee<Balance>;
+    type OnChargeTransaction = pallet_transaction_payment::CurrencyAdapter<Balances, DealWithFees>;
+    type WeightToFee = WeightToFee;
     type OperationalFeeMultiplier = OperationalFeeMultiplier;
-    type FeeMultiplierUpdate = ();
+    type FeeMultiplierUpdate = TargetedFeeAdjustment<
+        Self,
+        TargetBlockFullness,
+        AdjustmentVariable,
+        MinimumMultiplier,
+        MaximumMultiplier,
+    >;
     type LengthToFee = ConstantMultiplier<Balance, TransactionByteFee>;
 }
 
 parameter_types! {
     pub const TreasuryPalletId: PalletId = PalletId(*b"py/trsry");
     pub const DappsStakingPalletId: PalletId = PalletId(*b"py/dpsst");
+    pub const PotId: PalletId = PalletId(*b"PotStake");
 }
 
 type NegativeImbalance = <Balances as Currency<AccountId>>::NegativeImbalance;
+
+pub struct ToStakingPot;
+impl OnUnbalanced<NegativeImbalance> for ToStakingPot {
+    fn on_nonzero_unbalanced(amount: NegativeImbalance) {
+        let staking_pot = PotId::get().into_account_truncating();
+        Balances::resolve_creating(&staking_pot, amount);
+    }
+}
 
 pub struct DappsStakingTvlProvider();
 impl Get<Balance> for DappsStakingTvlProvider {
@@ -369,8 +437,8 @@ impl pallet_block_reward::BeneficiaryPayout<NegativeImbalance> for BeneficiaryPa
         Balances::resolve_creating(&TreasuryPalletId::get().into_account_truncating(), reward);
     }
 
-    fn collators(_reward: NegativeImbalance) {
-        // no collators for local dev node
+    fn collators(reward: NegativeImbalance) {
+        ToStakingPot::on_unbalanced(reward);
     }
 
     fn dapps_staking(stakers: NegativeImbalance, dapps: NegativeImbalance) {
@@ -379,7 +447,7 @@ impl pallet_block_reward::BeneficiaryPayout<NegativeImbalance> for BeneficiaryPa
 }
 
 parameter_types! {
-    pub const RewardAmount: Balance = 2_664 * MILLIAST;
+    pub const RewardAmount: Balance = 253_080 * MILLIASTR;
 }
 
 impl pallet_block_reward::Config for Runtime {
@@ -393,10 +461,10 @@ impl pallet_block_reward::Config for Runtime {
 
 parameter_types! {
     pub const BlockPerEra: BlockNumber = 60;
-    pub const RegisterDeposit: Balance = 100 * AST;
+    pub const RegisterDeposit: Balance = 100 * ASTR;
     pub const MaxNumberOfStakersPerContract: u32 = 512;
-    pub const MinimumStakingAmount: Balance = 10 * AST;
-    pub const MinimumRemainingAmount: Balance = AST;
+    pub const MinimumStakingAmount: Balance = 10 * ASTR;
+    pub const MinimumRemainingAmount: Balance = ASTR;
     pub const MaxUnlockingChunks: u32 = 2;
     pub const UnbondingPeriod: u32 = 2;
     pub const MaxEraStakeValues: u32 = 5;
@@ -462,9 +530,8 @@ impl pallet_xvm::Config for Runtime {
 }
 
 parameter_types! {
-    // Tells `pallet_base_fee` whether to calculate a new BaseFee `on_finalize` or not.
-    pub DefaultBaseFeePerGas: U256 = (MILLIAST / 1_000_000).into();
-    // At the moment, we don't use dynamic fee calculation for local chain by default
+    pub DefaultBaseFeePerGas: U256 = (MILLIASTR / 1_000_000).into();
+    // At the moment, we don't use dynamic fee calculation for Astar by default
     pub DefaultElasticity: Permill = Permill::zero();
 }
 
@@ -518,8 +585,8 @@ parameter_types! {
     /// * Dusty:   80
     /// * Shibuya: 81
     /// * Shiden: 336
-    /// * Local: 4369
-    pub ChainId: u64 = 0x1111;
+    /// * Astar:  592
+    pub ChainId: u64 = 0x250;
     /// EVM gas limit
     pub BlockGasLimit: U256 = U256::from(
         NORMAL_DISPATCH_RATIO * WEIGHT_REF_TIME_PER_SECOND / WEIGHT_PER_GAS
@@ -542,7 +609,7 @@ impl pallet_evm::Config for Runtime {
     type PrecompilesType = Precompiles;
     type PrecompilesValue = PrecompilesValue;
     type ChainId = ChainId;
-    type OnChargeTransaction = pallet_evm::EVMCurrencyAdapter<Balances, ()>;
+    type OnChargeTransaction = pallet_evm::EVMCurrencyAdapter<Balances, ToStakingPot>;
     type BlockGasLimit = BlockGasLimit;
     type OnCreate = ();
     type FindAuthor = FindAuthorTruncated<Aura>;
@@ -561,7 +628,7 @@ impl pallet_ethereum::Config for Runtime {
 
 parameter_types! {
     pub const EcdsaUnsignedPriority: TransactionPriority = TransactionPriority::MAX / 2;
-    pub const CallFee: Balance = AST / 10;
+    pub const CallFee: Balance = ASTR / 10;
     pub const CallMagicNumber: u16 = 0xff51;
 }
 
@@ -644,8 +711,8 @@ impl pallet_collective::Config<TechnicalCommitteeCollective> for Runtime {
 
 parameter_types! {
     pub const ProposalBond: Permill = Permill::from_percent(5);
-    pub const ProposalBondMinimum: Balance = 100 * AST;
-    pub const ProposalBondMaximum: Balance = 500 * AST;
+    pub const ProposalBondMinimum: Balance = 100 * ASTR;
+    pub const ProposalBondMaximum: Balance = 500 * ASTR;
     pub const SpendPeriod: BlockNumber = 1 * MINUTES;
     pub const Burn: Permill = Permill::from_percent(1);
 }
@@ -679,7 +746,7 @@ parameter_types! {
     pub LaunchPeriod: BlockNumber = 1 * MINUTES;
     pub VotingPeriod: BlockNumber = 3 * MINUTES;
     pub FastTrackVotingPeriod: BlockNumber = 1 * MINUTES;
-    pub const MinimumDeposit: Balance = 7000 * AST;
+    pub const MinimumDeposit: Balance = 7000 * ASTR;
     pub EnactmentPeriod: BlockNumber = 5 * MINUTES;
     pub VoteLockingPeriod: BlockNumber = 10 * MINUTES;
     pub CooloffPeriod: BlockNumber = 10 * MINUTES;
@@ -751,7 +818,7 @@ impl pallet_democracy::Config for Runtime {
 }
 
 parameter_types! {
-    pub const MinVestedTransfer: Balance = 1 * AST;
+    pub const MinVestedTransfer: Balance = 1 * ASTR;
     pub UnvestedFundsAllowedWithdrawReasons: WithdrawReasons =
         WithdrawReasons::except(WithdrawReasons::TRANSFER | WithdrawReasons::RESERVE);
 }
@@ -769,17 +836,28 @@ impl pallet_vesting::Config for Runtime {
 }
 
 parameter_types! {
-    pub const DepositPerItem: Balance = deposit(1, 0);
-    pub const DepositPerByte: Balance = deposit(0, 1);
+    pub const DepositPerItem: Balance = contracts_deposit(1, 0);
+    pub const DepositPerByte: Balance = contracts_deposit(0, 1);
     // The lazy deletion runs inside on_initialize.
     pub DeletionWeightLimit: Weight = AVERAGE_ON_INITIALIZE_RATIO *
         RuntimeBlockWeights::get().max_block;
     pub Schedule: pallet_contracts::Schedule<Runtime> = Default::default();
 }
 
+/// Codes using the randomness functionality cannot be uploaded. Neither can contracts
+/// be instantiated from existing codes that use this deprecated functionality.
+///
+/// But since some `Randomness` config type is still required for `pallet-contracts`, we provide this dummy type.
+pub struct DummyDeprecatedRandomness;
+impl Randomness<Hash, BlockNumber> for DummyDeprecatedRandomness {
+    fn random(_: &[u8]) -> (Hash, BlockNumber) {
+        (Default::default(), Zero::zero())
+    }
+}
+
 impl pallet_contracts::Config for Runtime {
     type Time = Timestamp;
-    type Randomness = RandomnessCollectiveFlip;
+    type Randomness = DummyDeprecatedRandomness;
     type Currency = Balances;
     type RuntimeEvent = RuntimeEvent;
     type RuntimeCall = RuntimeCall;
@@ -795,11 +873,7 @@ impl pallet_contracts::Config for Runtime {
     type CallStack = [pallet_contracts::Frame<Self>; 5];
     type WeightPrice = pallet_transaction_payment::Pallet<Self>;
     type WeightInfo = pallet_contracts::weights::SubstrateWeight<Self>;
-    type ChainExtension = (
-        DappsStakingExtension<Self>,
-        XvmExtension<Self>,
-        AssetsExtension<Self, pallet_chain_extension_assets::weights::SubstrateWeight<Self>>,
-    );
+    type ChainExtension = ();
     type DeletionQueueDepth = ConstU32<128>;
     type DeletionWeightLimit = DeletionWeightLimit;
     type Schedule = Schedule;
@@ -945,17 +1019,17 @@ impl pallet_proxy::Config for Runtime {
     type Currency = Balances;
     type ProxyType = ProxyType;
     // One storage item; key size 32, value size 8; .
-    type ProxyDepositBase = ConstU128<{ AST * 10 }>;
+    type ProxyDepositBase = ConstU128<{ ASTR * 10 }>;
     // Additional storage item size of 33 bytes.
-    type ProxyDepositFactor = ConstU128<{ MILLIAST * 330 }>;
+    type ProxyDepositFactor = ConstU128<{ MILLIASTR * 330 }>;
     type MaxProxies = ConstU32<32>;
     type WeightInfo = pallet_proxy::weights::SubstrateWeight<Runtime>;
     type MaxPending = ConstU32<32>;
     type CallHasher = BlakeTwo256;
     // Key size 32 + 1 item
-    type AnnouncementDepositBase = ConstU128<{ AST * 10 }>;
+    type AnnouncementDepositBase = ConstU128<{ ASTR * 10 }>;
     // Acc Id + Hash + block number
-    type AnnouncementDepositFactor = ConstU128<{ MILLIAST * 660 }>;
+    type AnnouncementDepositFactor = ConstU128<{ MILLIASTR * 660 }>;
 }
 
 // TODO: remove this once https://github.com/paritytech/substrate/issues/12161 is resolved

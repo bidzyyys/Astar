@@ -11,6 +11,7 @@ repository.workspace = true
 log = { workspace = true, optional = true }
 parity-scale-codec = { workspace = true }
 scale-info = { workspace = true }
+smallvec = { workspace = true }
 
 fp-rpc = { workspace = true }
 fp-self-contained = { workspace = true }
